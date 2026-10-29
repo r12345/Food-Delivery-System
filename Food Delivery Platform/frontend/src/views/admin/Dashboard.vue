@@ -27,7 +27,7 @@
 
 <script setup>
 import * as echarts from 'echarts'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { aStatsOverview, aStatsTrend, aStatsHotShops, aStatsStatus } from '../../api'
 
 const overview = ref({})
@@ -88,15 +88,27 @@ function renderHot(list) {
   })
 }
 
+function handleResize() {
+  [trendRef, pieRef, hotRef].forEach(r => echarts.getInstanceByDom(r.value)?.resize())
+}
+
 onMounted(async () => {
   overview.value = await aStatsOverview()
   renderTrend((await aStatsTrend()).list)
   renderPie((await aStatsStatus()).list)
   renderHot((await aStatsHotShops()).list)
-  window.addEventListener('resize', () => {
-    [trendRef, pieRef, hotRef].forEach(r => echarts.getInstanceByDom(r.value)?.resize())
+  window.addEventListener('resize', handleResize)
+})
+
+// 修正：组件卸载时移除 resize 监听并销毁实例，否则监听器泄漏、图表实例常驻内存
+onUnmounted(() => {
+  window.removeEventListener('resize', handleResize)
+  ;[trendRef, pieRef, hotRef].forEach(r => {
+    const inst = r.value && echarts.getInstanceByDom(r.value)
+    if (inst) inst.dispose()
   })
 })
+
 </script>
 
 <style scoped>

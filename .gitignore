@@ -1,0 +1,35 @@
+# ---- IDE / 编辑器本地配置（不上传）----
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+
+# ---- Python 虚拟环境与缓存 ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+.pytest_cache/
+
+# ---- Node / 前端构建产物 ----
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+
+# ---- 运行时产生文件 ----
+backend/uploads/
+uploads/
+*.log
+
+# ---- 项目文档（按需保留在本地，不上传）----
+Food Delivery Platform/docs/
+
+# ---- 环境变量 / 凭据文件（严禁上传）----
+.env
+.env.*
+*.pem
+*.key

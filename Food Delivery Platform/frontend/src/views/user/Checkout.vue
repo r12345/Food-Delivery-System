@@ -88,7 +88,8 @@ const discount = computed(() => {
 })
 const payAmount = computed(() => Math.max(0, total.value + deliveryFee.value - discount.value))
 const usableCoupons = computed(() =>
-  coupons.value.filter(c => (c.shop_id === 0 || c.shop_id === shopId) && total.value >= c.threshold))
+  coupons.value.filter(c => !c.expired && c.uc_status === 'unused' &&
+    (c.shop_id === 0 || c.shop_id === shopId) && total.value >= c.threshold))
 
 async function submit() {
   if (!addressId.value) return ElMessage.warning('请选择收货地址')

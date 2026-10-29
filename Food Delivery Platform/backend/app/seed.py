@@ -1,4 +1,5 @@
-"""演示种子数据：账号 / 店铺 / 菜品 / 轮播 / 优惠券"""
+"""演示种子数据：账号 / 店铺 / 菜品 / 轮播 / 优惠券 / 各状态订单"""
+import secrets
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -9,6 +10,12 @@ from .security import hash_password
 def img(prompt: str, size: str = "square") -> str:
     """通过文生图接口生成真实图片 URL"""
     return f"https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt={quote(prompt)}&image_size={size}"
+
+
+def _order_no(dt: datetime) -> str:
+    """订单号：yyyyMMddHHmmss + 6 位随机十六进制（与 consumer._gen_order_no 规则一致）"""
+    return dt.strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
+
 
 
 def seed(db):
@@ -135,3 +142,116 @@ def seed(db):
     ])
 
     db.commit()
+    _seed_demo_orders(db, u1, u2, shop1, shop2, fc1, fc2)
+
+
+def _seed_demo_orders(db, u1, u2, shop1, shop2, fc1, fc2):
+    """写入一批覆盖各状态的演示订单，便于演示订单列表 / 商家处理 / 数据大屏。
+
+    约定：仅用于演示，金额与快照均按"下单当时"固化，与线上逻辑保持一致。
+    """
+    def addr_of(u):
+        return {"name": u.nickname, "phone": u.phone or "13900000000",
+                "region": "北京市 朝阳区", "detail": "演示地址"}
+
+    # 取菜品引用
+    f_gbjd = db.query(models.Food).filter_by(name="宫保鸡丁").first()
+    f_yxrs = db.query(models.Food).filter_by(name="鱼香肉丝").first()
+    f_zzf = db.query(models.Food).filter_by(name="扬州炒饭").first()
+    f_zsmyt = db.query(models.Food).filter_by(name="冰镇酸梅汤").first()
+    f_zznc = db.query(models.Food).filter_by(name="珍珠奶茶").first()
+    f_yzgl = db.query(models.Food).filter_by(name="杨枝甘露").first()
+
+    def make_order(user, shop, days_ago, status, items, pay=True, review=None,
+                   remark="", discount=0):
+        """items: [(food, qty, spec, unit_price)]"""
+        created = datetime.now() - timedelta(days=days_ago, hours=days_ago % 5)
+        total = round(sum(p * q for _, q, _, p in items), 2)
+        o = models.Order(
+            order_no=_order_no(created), user_id=user.id, shop_id=shop.id,
+            address=addr_of(user), status=status, total_amount=total,
+            delivery_fee=shop.delivery_fee, discount_amount=discount,
+            pay_amount=round(total + shop.delivery_fee - discount, 2),
+            pay_type="wechat" if pay else "",
+            pay_time=created + timedelta(minutes=2) if pay else None,
+            remark=remark, created_at=created)
+        db.add(o)
+        db.flush()
+        for food, qty, spec, price in items:
+            if food:
+                db.add(models.OrderItem(order_id=o.id, food_id=food.id, food_name=food.name,
+                                        image=food.image, price=price, quantity=qty, spec=spec))
+                if status not in ("cancelled", "refunded"):
+                    food.sales += qty
+                    food.stock = max(0, food.stock - qty)
+        if pay and status not in ("cancelled", "refunded"):
+            db.add(models.FinanceRecord(shop_id=shop.id, order_id=o.id, type="order_income",
+                                        amount=o.pay_amount, remark="订单收入", created_at=created))
+        if status == "refunded":
+            db.add(models.FinanceRecord(shop_id=shop.id, order_id=o.id, type="refund",
+                                        amount=-o.pay_amount, remark="退款", created_at=created))
+        if review:
+            sr, rr, content, reply = review
+            db.add(models.Evaluation(order_id=o.id, user_id=user.id, shop_id=shop.id,
+                                     shop_rating=sr, rider_rating=rr, content=content,
+                                     reply=reply or "", created_at=created + timedelta(hours=1)))
+        return o
+
+    # 已完成（含评价与商家回复）——用于评价管理、店铺评分演示
+    make_order(u1, shop1, 6, "completed",
+               [(f_gbjd, 2, "", 28.0), (f_zsmyt, 2, "", 6.0)],
+               review=(5, 4.5, "宫保鸡丁很正宗，分量足！", "感谢支持，欢迎再来～"))
+    make_order(u2, shop2, 4, "completed",
+               [(f_zznc, 2, "少冰/半糖", 12.0), (f_yzgl, 1, "", 18.0)],
+               review=(5, 5, "杨枝甘露料很足，甜度刚好", ""))
+    make_order(u1, shop1, 2, "completed",
+               [(f_yxrs, 1, "", 26.0), (f_zzf, 1, "", 18.0), (f_zsmyt, 1, "", 6.0)])
+
+    # 配送中——商家"待送达"，用户可"确认收货"
+    make_order(u1, shop1, 0, "delivering",
+               [(f_gbjd, 1, "", 28.0), (f_zzf, 1, "", 18.0)], remark="少放辣")
+
+    # 备餐中——商家"待出餐"
+    make_order(u2, shop2, 0, "preparing",
+               [(f_zznc, 3, "去冰/标准糖", 12.0)], discount=4)
+
+    # 待接单——商家"待接单"列表 + WebSocket 推送演示
+    make_order(u1, shop1, 0, "pending_accept",
+               [(f_yxrs, 2, "", 26.0), (f_zsmyt, 1, "", 6.0)])
+
+    # 待付款——用户"待付款"列表
+    make_order(u2, shop1, 0, "pending_pay",
+               [(f_gbjd, 1, "", 28.0)], pay=False)
+
+    # 退款中——商家/平台"退款审核"演示
+    make_order(u2, shop2, 1, "refunding",
+               [(f_yzgl, 2, "", 18.0)], remark="送晚了")
+
+    # 已退款——退款流水演示
+    make_order(u1, shop2, 3, "refunded",
+               [(f_zznc, 1, "常温/三分糖", 12.0)])
+
+    # 已取消（未支付）
+    make_order(u2, shop1, 5, "cancelled",
+               [(f_zzf, 1, "", 18.0)], pay=False)
+
+    # ---------- 用户优惠券（已领取，供结算页使用） ----------
+    cps = db.query(models.Coupon).all()
+    for u in (u1, u2):
+        for cp in cps:
+            exists = db.query(models.UserCoupon).filter_by(
+                user_id=u.id, coupon_id=cp.id).count()
+            if not exists:
+                db.add(models.UserCoupon(user_id=u.id, coupon_id=cp.id))
+                cp.received += 1
+
+    # ---------- 汇总校正 ----------
+    for shop in (shop1, shop2):
+        cnt = db.query(models.Order).filter(
+            models.Order.shop_id == shop.id,
+            models.Order.status.in_(["pending_accept", "preparing", "delivering", "completed"])
+        ).count()
+        shop.sales = cnt * 37   # 历史累计销量（演示用基数，非真实统计）
+
+    db.commit()
+

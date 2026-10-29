@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..config import UPLOAD_DIR
+from ..config import ALLOWED_IMAGE_EXT, MAX_UPLOAD_SIZE, UPLOAD_DIR
 from ..db import get_db
 from ..deps import get_current_user
 
@@ -45,13 +45,27 @@ DICTS = {
 @router.post("/upload", tags=["文件上传"])
 async def upload(file: UploadFile, user: models.User = Depends(get_current_user)):
     ext = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
-    if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"):
+    if ext not in ALLOWED_IMAGE_EXT:
         raise HTTPException(400, "仅支持图片格式")
+    # 修正：分块读取并限制大小，避免超大文件一次性读入内存打爆服务
+    content = bytearray()
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                400, f"文件过大，最大支持 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB")
+    if not content:
+        raise HTTPException(400, "文件内容为空")
+
     name = f"{int(time.time() * 1000)}_{user.id}{ext}"
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
-        f.write(await file.read())
+        f.write(bytes(content))
     return {"url": f"/uploads/{name}"}
+
 
 
 @router.get("/regions")

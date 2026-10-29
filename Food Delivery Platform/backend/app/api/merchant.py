@@ -190,6 +190,27 @@ def m_order_detail(db: Session, o: models.Order) -> dict:
     return d
 
 
+def m_order_details(db: Session, orders: list[models.Order]) -> list[dict]:
+    """批量组装，修正 N+1 查询。"""
+    if not orders:
+        return []
+    ids = [o.id for o in orders]
+    items_map: dict[int, list] = {}
+    for it in db.query(models.OrderItem).filter(models.OrderItem.order_id.in_(ids)).all():
+        items_map.setdefault(it.order_id, []).append(it.to_dict())
+    users = {u.id: u for u in db.query(models.User)
+             .filter(models.User.id.in_({o.user_id for o in orders})).all()}
+    result = []
+    for o in orders:
+        u = users.get(o.user_id)
+        d = o.to_dict()
+        d["items"] = items_map.get(o.id, [])
+        d["user_name"] = u.nickname if u else ""
+        result.append(d)
+    return result
+
+
+
 @router.get("/orders")
 def merchant_orders(status: str = "", page: int = 1, size: int = 10,
                     db: Session = Depends(get_db), user: models.User = Depends(require_roles("merchant"))):
@@ -199,7 +220,7 @@ def merchant_orders(status: str = "", page: int = 1, size: int = 10,
         q = q.filter_by(status=status)
     total = q.count()
     items = q.order_by(models.Order.id.desc()).offset((page - 1) * size).limit(size).all()
-    return {"list": [m_order_detail(db, o) for o in items], "total": total}
+    return {"list": m_order_details(db, items), "total": total}
 
 
 @router.get("/orders/{order_id}")
@@ -447,4 +468,4 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(require
     recent = (db.query(models.Order).filter_by(shop_id=shop.id)
               .order_by(models.Order.id.desc()).limit(5).all())
     return {"summary": summary, "shop": shop.to_dict(),
-            "recent_orders": [m_order_detail(db, o) for o in recent]}
+            "recent_orders": m_order_details(db, recent)}

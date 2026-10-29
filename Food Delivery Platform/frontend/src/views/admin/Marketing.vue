@@ -85,13 +85,14 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAuth } from '../../stores/auth'
 import { aGetBanners, aAddBanner, aDeleteBanner, aGetPlatformCoupons, aAddPlatformCoupon } from '../../api'
 
 const auth = useAuth()
-const upHeaders = { Authorization: 'Bearer ' + auth.token }
+// 修正：用 computed 保持响应式，token 刷新后上传请求不会携带过期令牌
+const upHeaders = computed(() => ({ Authorization: 'Bearer ' + auth.token }))
 const banners = ref([])
 const coupons = ref([])
 const bannerOpen = ref(false)

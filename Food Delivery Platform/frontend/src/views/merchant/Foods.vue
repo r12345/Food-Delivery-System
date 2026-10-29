@@ -121,14 +121,15 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuth } from '../../stores/auth'
 import { mGetCategories, mAddCategory, mUpdateCategory, mDeleteCategory,
          mGetFoods, mAddFood, mUpdateFood, mDeleteFood } from '../../api'
 
 const auth = useAuth()
-const upHeaders = { Authorization: 'Bearer ' + auth.token }
+// 修正：用 computed 保持响应式，token 刷新后上传请求不会携带过期令牌
+const upHeaders = computed(() => ({ Authorization: 'Bearer ' + auth.token }))
 const categories = ref([])
 const foods = ref([])
 const query = reactive({ keyword: '', category_id: null })

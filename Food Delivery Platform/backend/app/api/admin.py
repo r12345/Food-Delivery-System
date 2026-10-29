@@ -109,6 +109,31 @@ def admin_order_detail(db: Session, o: models.Order) -> dict:
     return d
 
 
+def admin_order_details(db: Session, orders: list[models.Order]) -> list[dict]:
+    """批量组装，修正 N+1 查询。"""
+    if not orders:
+        return []
+    ids = [o.id for o in orders]
+    items_map: dict[int, list] = {}
+    for it in db.query(models.OrderItem).filter(models.OrderItem.order_id.in_(ids)).all():
+        items_map.setdefault(it.order_id, []).append(it.to_dict())
+    shops = {s.id: s for s in db.query(models.Shop)
+             .filter(models.Shop.id.in_({o.shop_id for o in orders})).all()}
+    users = {u.id: u for u in db.query(models.User)
+             .filter(models.User.id.in_({o.user_id for o in orders})).all()}
+    result = []
+    for o in orders:
+        shop = shops.get(o.shop_id)
+        u = users.get(o.user_id)
+        d = o.to_dict()
+        d["items"] = items_map.get(o.id, [])
+        d["shop_name"] = shop.name if shop else ""
+        d["user_name"] = (u.nickname or u.username) if u else ""
+        result.append(d)
+    return result
+
+
+
 @router.get("/orders")
 def all_orders(status: str = "", keyword: str = "", page: int = 1, size: int = 10,
                db: Session = Depends(get_db)):
@@ -119,7 +144,7 @@ def all_orders(status: str = "", keyword: str = "", page: int = 1, size: int = 1
         q = q.filter(models.Order.order_no.like(f"%{keyword}%"))
     total = q.count()
     items = q.order_by(models.Order.id.desc()).offset((page - 1) * size).limit(size).all()
-    return {"list": [admin_order_detail(db, o) for o in items], "total": total}
+    return {"list": admin_order_details(db, items), "total": total}
 
 
 @router.post("/orders/{order_id}/refund-agree")

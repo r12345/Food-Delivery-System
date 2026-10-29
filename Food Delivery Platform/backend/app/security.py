@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import random
 import secrets
 import string
@@ -40,12 +41,27 @@ def decode_token(token: str) -> dict:
 
 # ---------- 图形验证码(SVG) ----------
 _CAPTCHAS: dict[str, tuple[str, float]] = {}
+_CAPTCHA_MAX = 2000          # 字典容量上限，防止被刷爆内存
+_CAPTCHA_TTL = 300           # 验证码有效期（秒）
+
+
+def _purge_expired(now: float) -> None:
+    """清理已过期验证码，避免字典无限增长。"""
+    expired = [k for k, (_, exp) in _CAPTCHAS.items() if exp <= now]
+    for k in expired:
+        _CAPTCHAS.pop(k, None)
 
 
 def make_captcha() -> tuple[str, str]:
+    now = time.time()
+    # 每次生成前清理过期项；若仍超过容量上限则整体清空（防刷）
+    _purge_expired(now)
+    if len(_CAPTCHAS) >= _CAPTCHA_MAX:
+        _CAPTCHAS.clear()
+
     code = "".join(random.choices(string.digits, k=4))
     cid = secrets.token_hex(8)
-    _CAPTCHAS[cid] = (code, time.time() + 300)
+    _CAPTCHAS[cid] = (code, now + _CAPTCHA_TTL)
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="34">'
         '<rect width="100%" height="100%" fill="#f0f2f5"/>'
@@ -57,7 +73,14 @@ def make_captcha() -> tuple[str, str]:
 
 
 def check_captcha(cid: str, code: str) -> bool:
-    if not cid:
+    """校验验证码：一次性使用，校验后立即移除；用 hmac 比较避免时序攻击。"""
+    if not cid or not code:
         return False
     item = _CAPTCHAS.pop(cid, None)
-    return bool(item and item[1] > time.time() and item[0] == code)
+    if not item:
+        return False
+    stored, expire_at = item
+    if expire_at <= time.time():
+        return False
+    return hmac.compare_digest(stored, str(code))
+

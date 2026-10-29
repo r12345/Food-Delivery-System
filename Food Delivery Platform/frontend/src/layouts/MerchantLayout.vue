@@ -55,6 +55,9 @@ const auth = useAuth()
 const shop = ref({})
 const newOrders = ref(0)
 let ws = null
+let reconnectTimer = null
+let closedByUs = false
+let retry = 0
 
 const openState = computed({
   get: () => !!shop.value.is_open,
@@ -70,14 +73,20 @@ async function toggleOpen(v) {
 }
 
 function doLogout() {
+  closedByUs = true
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  if (ws) { ws.onclose = null; ws.close(); ws = null }
   auth.logout()
   router.push('/login')
 }
 
 function connectWS() {
   if (auth.role !== 'merchant') return
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
+  closedByUs = false
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   ws = new WebSocket(`${proto}://${location.host}/ws/merchant?token=${auth.token}`)
+  ws.onopen = () => { retry = 0 }
   ws.onmessage = e => {
     const d = JSON.parse(e.data)
     if (d.type === 'new_order') {
@@ -86,13 +95,26 @@ function connectWS() {
       bus.emit('merchant-new-order', d)
     }
   }
-  ws.onclose = () => setTimeout(connectWS, 5000) // 断线重连
+  ws.onclose = () => {
+    ws = null
+    // 修正：组件卸载 / 主动登出后不再重连，避免形成重连循环；重连间隔按退避递增
+    if (closedByUs) return
+    retry = Math.min(retry + 1, 6)
+    const delay = Math.min(3000 * retry, 30000)
+    reconnectTimer = setTimeout(connectWS, delay)
+  }
+  ws.onerror = () => { /* 交由 onclose 统一处理重连 */ }
 }
 
 watch(() => router.currentRoute.value.path, p => { if (p === '/merchant/orders') newOrders.value = 0 })
 
 onMounted(() => { loadShop(); connectWS() })
-onUnmounted(() => ws && ws.close())
+onUnmounted(() => {
+  closedByUs = true
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  if (ws) { ws.onclose = null; ws.close(); ws = null }
+})
+
 </script>
 
 <style scoped>

@@ -96,7 +96,8 @@ const favorites = ref([])
 const myCoupons = ref([])
 const evals = ref([])
 const receivable = ref([])
-const upHeaders = { Authorization: 'Bearer ' + auth.token }
+// 修正：用 computed 保持响应式，token 刷新后上传请求不会携带过期令牌
+const upHeaders = computed(() => ({ Authorization: 'Bearer ' + auth.token }))
 
 const shownCoupons = computed(() =>
   cpTab.value === 'unused'

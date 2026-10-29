@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta
 
@@ -7,6 +9,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..config import SECRET_KEY
 from ..db import get_db
 from ..deps import get_current_user, require_roles
 from ..api.ws import push_to_merchant
@@ -14,6 +17,15 @@ from ..api.ws import push_to_merchant
 router = APIRouter(tags=["C端"])
 
 PAYABLE_STATUSES = ("pending_accept", "preparing", "delivering", "completed")
+
+
+def _verify_pay_sign(order_no: str, sign: str) -> bool:
+    """模拟支付网关回调验签：sign = HMAC-SHA256(order_no, SECRET_KEY) 的前 32 位十六进制。"""
+    if not sign:
+        return False
+    expect = hmac.new(SECRET_KEY.encode(), order_no.encode(), hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(expect, sign)
+
 
 
 def get_shop_or_404(db: Session, shop_id: int) -> models.Shop:
@@ -155,6 +167,8 @@ def cart_list(db: Session = Depends(get_db), user: models.User = Depends(get_cur
 @router.post("/cart")
 def cart_add(data: CartAddIn, db: Session = Depends(get_db),
              user: models.User = Depends(get_current_user)):
+    if data.quantity <= 0:
+        raise HTTPException(400, "数量必须大于 0")
     food = db.get(models.Food, data.food_id)
     if not food or food.status != 1:
         raise HTTPException(400, "菜品已下架")
@@ -164,6 +178,10 @@ def cart_add(data: CartAddIn, db: Session = Depends(get_db),
     unit_price = round(food.price + _spec_delta(food, data.spec), 2)
     item = (db.query(models.Cart)
             .filter_by(user_id=user.id, food_id=food.id, spec=data.spec).first())
+    # 修正：加购时校验库存，避免购物车数量超过可售库存
+    already = item.quantity if item else 0
+    if already + data.quantity > food.stock:
+        raise HTTPException(400, f"库存不足，当前仅剩 {food.stock} 份")
     if item:
         item.quantity += data.quantity
     else:
@@ -171,6 +189,7 @@ def cart_add(data: CartAddIn, db: Session = Depends(get_db),
                            quantity=data.quantity, spec=data.spec, unit_price=unit_price))
     db.commit()
     return {"count": func_sum_cart(db, user.id)}
+
 
 
 @router.put("/cart/{item_id}")
@@ -182,9 +201,14 @@ def cart_update(item_id: int, data: CartUpdateIn, db: Session = Depends(get_db),
     if data.quantity <= 0:
         db.delete(item)
     else:
+        food = db.get(models.Food, item.food_id)
+        # 修正：修改数量时同样校验库存上限
+        if food and data.quantity > food.stock:
+            raise HTTPException(400, f"库存不足，当前仅剩 {food.stock} 份")
         item.quantity = data.quantity
     db.commit()
     return {"count": func_sum_cart(db, user.id)}
+
 
 
 @router.delete("/cart/{item_id}")
@@ -227,6 +251,36 @@ def order_detail(db: Session, o: models.Order) -> dict:
     return d
 
 
+def order_details(db: Session, orders: list[models.Order]) -> list[dict]:
+    """批量组装订单详情，修正 N+1：一次查完所有明细/店铺/评价。"""
+    if not orders:
+        return []
+    ids = [o.id for o in orders]
+    shop_ids = {o.shop_id for o in orders}
+
+    items_map: dict[int, list] = {}
+    for it in db.query(models.OrderItem).filter(models.OrderItem.order_id.in_(ids)).all():
+        items_map.setdefault(it.order_id, []).append(it.to_dict())
+
+    shops = {s.id: s for s in db.query(models.Shop)
+             .filter(models.Shop.id.in_(shop_ids)).all()}
+
+    evaluated = {row[0] for row in db.query(models.Evaluation.order_id)
+                 .filter(models.Evaluation.order_id.in_(ids)).all()}
+
+    result = []
+    for o in orders:
+        shop = shops.get(o.shop_id)
+        d = o.to_dict()
+        d["items"] = items_map.get(o.id, [])
+        d["shop_name"] = shop.name if shop else ""
+        d["shop_logo"] = shop.logo if shop else ""
+        d["has_evaluation"] = o.id in evaluated
+        result.append(d)
+    return result
+
+
+
 def _gen_order_no() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
 
@@ -266,6 +320,15 @@ def create_order(data: OrderCreateIn, db: Session = Depends(get_db),
     if total < shop.min_price:
         raise HTTPException(400, f"未达到起送价 ¥{shop.min_price}")
 
+    # 修正：下单前逐项校验库存与上架状态，库存不足直接拒绝，避免超卖
+    for it in cart_items:
+        food = db.get(models.Food, it.food_id)
+        if not food or food.status != 1:
+            raise HTTPException(400, f"「{food.name if food else '菜品'}」已下架，请从购物车移除")
+        if it.quantity > food.stock:
+            raise HTTPException(
+                400, f"「{food.name}」库存不足，仅剩 {food.stock} 份，请调整数量")
+
     # 优惠券
     discount = 0
     if data.coupon_id:
@@ -304,7 +367,8 @@ def create_order(data: OrderCreateIn, db: Session = Depends(get_db),
                                 quantity=it.quantity, spec=it.spec))
         if food:
             food.sales += it.quantity
-            food.stock = max(0, food.stock - it.quantity)
+            # 修正：前面已校验库存充足，这里直接扣减即可（不再用 max(0,...) 掩盖超卖）
+            food.stock = food.stock - it.quantity
     shop.sales += 1
     db.query(models.Cart).filter_by(user_id=user.id, shop_id=data.shop_id).delete()
     db.commit()
@@ -319,24 +383,43 @@ def my_orders(status: str = "", page: int = 1, size: int = 10,
         q = q.filter_by(status=status)
     total = q.count()
     items = q.order_by(models.Order.id.desc()).offset((page - 1) * size).limit(size).all()
-    return {"list": [order_detail(db, o) for o in items], "total": total}
+    return {"list": order_details(db, items), "total": total}
 
 
 @router.get("/orders/{order_id}")
 def order_info(order_id: int, db: Session = Depends(get_db),
                user: models.User = Depends(get_current_user)):
+    """订单详情：普通用户仅可查看自己的订单；商家仅可查看本店订单；管理员可查看全部。"""
     o = db.get(models.Order, order_id)
-    if not o or (o.user_id != user.id and user.role == "user"):
+    if not o:
         raise HTTPException(404, "订单不存在")
+
+    if user.role == "admin":
+        pass
+    elif user.role == "merchant":
+        shop = db.query(models.Shop).filter_by(owner_id=user.id).first()
+        if not shop or o.shop_id != shop.id:
+            raise HTTPException(403, "无权查看该订单")
+    elif o.user_id != user.id:
+        raise HTTPException(403, "无权查看该订单")
+
     return order_detail(db, o)
 
 
 @router.post("/pay/notify")
-def pay_notify(data: PayIn, order_no: str, db: Session = Depends(get_db)):
-    """支付回调（模拟）：/api/pay/notify?order_no=xxx"""
+def pay_notify(data: PayIn, order_no: str, sign: str = "",
+               db: Session = Depends(get_db)):
+    """支付回调（模拟网关）。
+
+    修正：原实现无任何校验，任何人凭订单号即可把订单置为已支付。
+    现要求携带与 SECRET_KEY 派生的回调签名 sign，签名不符一律拒绝。
+    真实接入时这里应替换为微信/支付宝的验签逻辑。
+    """
     order = db.query(models.Order).filter_by(order_no=order_no).first()
     if not order:
         raise HTTPException(404, "订单不存在")
+    if not _verify_pay_sign(order_no, sign):
+        raise HTTPException(403, "支付回调签名校验失败")
     owner_id = do_pay(db, order, data.pay_type)
     return {"ok": True, "order_no": order.order_no, "owner_id": owner_id}
 
@@ -435,6 +518,7 @@ def create_evaluation(order_id: int, data: EvalIn, db: Session = Depends(get_db)
                            shop_rating=data.shop_rating, rider_rating=data.rider_rating,
                            content=data.content)
     db.add(ev)
+    db.flush()   # 修正：先 flush 让新评价进入本次事务，否则平均分漏算当前这条
     # 更新店铺评分
     shop = db.get(models.Shop, o.shop_id)
     if shop:
@@ -442,6 +526,7 @@ def create_evaluation(order_id: int, data: EvalIn, db: Session = Depends(get_db)
         shop.rating = round(float(avg), 1) if avg else 5.0
     db.commit()
     return ev.to_dict()
+
 
 
 def func_avg_eval():
